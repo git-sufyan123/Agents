@@ -1,0 +1,322 @@
+{
+  "name": "Daily Story/Rhyme -> AI Short -> YouTube (v2)",
+  "active": false,
+  "nodes": [
+    {
+      "id": "trigger1",
+      "name": "Daily Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [ -2000, 0 ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "hours", "hoursInterval": 24, "triggerAtHour": 10, "triggerAtMinute": 0 }
+          ]
+        }
+      },
+      "notes": "You can ignore this trigger entirely and just click 'Execute Workflow' manually any time — it does not need to be active/scheduled for manual runs."
+    },
+    {
+      "id": "controlCheck",
+      "name": "Check Control Sheet (Pause Switch)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ -1780, 0 ],
+      "parameters": {
+        "operation": "read",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "value": "Control", "mode": "name" },
+        "filtersUI": {}
+      },
+      "notes": "One-row 'Control' tab, column 'Status' = active/paused. Flip to 'paused' any time to stop future runs."
+    },
+    {
+      "id": "ifPaused",
+      "name": "IF Status = active",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [ -1560, 0 ],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "strict" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.Status }}",
+              "rightValue": "active",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "stopNode",
+      "name": "Stop (Paused)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [ -1340, 140 ],
+      "parameters": {}
+    },
+    {
+      "id": "getStoryBank",
+      "name": "Get Unused Stories",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ -1340, -140 ],
+      "parameters": {
+        "operation": "read",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "value": "StoryBank", "mode": "name" },
+        "filtersUI": {
+          "values": [ { "lookupColumn": "Used", "lookupValue": "FALSE" } ]
+        }
+      },
+      "notes": "StoryBank tab columns: ID | Title | Type | SourceText | Used | LastUsedDate | VideoURL. Pre-load ~20+ public-domain fables/rhymes."
+    },
+    {
+      "id": "pickRandom",
+      "name": "Pick Random Unused Item",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -1120, -140 ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nif (items.length === 0) {\n  throw new Error('StoryBank exhausted — add more rows or reset Used to FALSE.');\n}\nconst pick = items[Math.floor(Math.random() * items.length)];\nreturn [pick];"
+      }
+    },
+    {
+      "id": "generateScript",
+      "name": "AI: Script + Video Prompt + Metadata (Gemini)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ -900, -140 ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [ { "name": "x-goog-api-key", "value": "YOUR_GEMINI_API_KEY" } ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  system_instruction: {\n    parts: [{ text: \"You write tight, visual scripts for 45-55 second narrated YouTube Shorts based on classic public-domain stories/rhymes. Output ONLY valid JSON, no markdown fences, matching this schema: {\\\"narration\\\": string (<=130 words, simple spoken language), \\\"scenes\\\": [{\\\"description\\\": string (a single detailed image prompt: subject, setting, art style, lighting), \\\"duration_seconds\\\": number}], \\\"title\\\": string (<=70 chars), \\\"description\\\": string (150-300 words, hook + summary + CTA + 3-5 hashtags), \\\"tags\\\": [string] (12-18 tags), \\\"thumbnail_text\\\": string (<=5 words)}. Aim for 6-9 scenes of 5-7 seconds each. Keep art style consistent across scenes, e.g. warm watercolor storybook illustration.\" }]\n  },\n  contents: [{\n    role: \"user\",\n    parts: [{ text: \"Source material title: \" + $json.Title + \"\\nType: \" + $json.Type + \"\\nSource text:\\n\" + $json.SourceText }]\n  }]\n}) }}",
+        "options": {}
+      },
+      "notes": "Free Gemini API key from aistudio.google.com — no card needed. Replace YOUR_GEMINI_API_KEY."
+    },
+    {
+      "id": "parseAiJson",
+      "name": "Parse AI JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -680, -140 ],
+      "parameters": {
+        "jsCode": "const item = $input.first().json;\nconst src = item.body || item; // handles 'Full Response' wrapping under .body\nconst raw = src.candidates?.[0]?.content?.parts?.[0]?.text\n         || item.message?.content\n         || item.content\n         || item.text;\n\nif (!raw) {\n  throw new Error('No text found. Top-level keys were: ' + JSON.stringify(Object.keys(item)));\n}\n\nconst clean = raw.trim().replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();\nconst parsed = JSON.parse(clean);\nreturn [{ json: parsed }];"
+      }
+    },
+    {
+      "id": "ttsNode",
+      "name": "Generate Narration Audio (TTS)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ -460, -260 ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5000/tts",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.narration }) }}",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "notes": "Free local gTTS endpoint (no ElevenLabs restrictions). Make sure ffmpeg_service/app.py is running (python app.py)."
+    },
+    {
+      "id": "encodeAudioB64",
+      "name": "Encode Audio Base64",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -240, -260 ],
+      "parameters": {
+        "jsCode": "const item = $input.first();\nreturn [{ json: { audio_base64: item.binary.data.data } }];"
+      }
+    },
+    {
+      "id": "splitScenes",
+      "name": "Split Out Scenes",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [ -460, -20 ],
+      "parameters": { "fieldToSplitOut": "scenes" },
+      "notes": "One item per scene, each carrying that scene's {description, duration_seconds} under $json.scenes."
+    },
+    {
+      "id": "videoGenNode",
+      "name": "Generate Scene Image (Pollinations.ai)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ -240, -20 ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://image.pollinations.ai/prompt/{{ encodeURIComponent(($json.scenes?.description || $json.description || 'storybook scene') + ', warm watercolor storybook illustration, no text') }}",
+        "sendQuery": true,
+        "queryParameters": { "parameters": [
+          { "name": "width", "value": "1080" },
+          { "name": "height", "value": "1920" },
+          { "name": "nologo", "value": "true" },
+          { "name": "seed", "value": "={{ $('Pick Random Unused Item').item.json.ID }}-{{ $itemIndex }}" }
+        ] },
+        "options": {
+          "batching": { "batch": { "batchSize": 1, "batchInterval": 18000 } },
+          "response": { "response": { "responseFormat": "file" } }
+        }
+      },
+      "notes": "Free, no key, no billing ambiguity. Pollinations' documented anonymous-tier limit is 1 request/15s — batched at 18s to stay safely under it. With 8 scenes this step takes ~2.5 minutes total; that's fine for a background daily job."
+    },
+    {
+      "id": "extractImageB64",
+      "name": "Extract Image Base64",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ -20, -20 ],
+      "parameters": {
+        "jsCode": "const item = $input.first();\nreturn [{ json: { image_base64: item.binary.data.data } }];"
+      },
+      "notes": "Pollinations returns a binary image file directly, so this just base64-reads it — same pattern as the audio encoding step."
+    },
+    {
+      "id": "collectImages",
+      "name": "Collect All Scene Images",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [ 200, -20 ],
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst images = items.map(i => i.json.image_base64);\nreturn [{ json: { images } }];"
+      },
+      "notes": "Runs once for all items (default Code node behaviour) — collects every scene's base64 image into one array."
+    },
+    {
+      "id": "mergeNode",
+      "name": "Merge Audio + Images",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.1,
+      "position": [ 200, -260 ],
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "notes": "Input 1 = Encode Audio Base64. Input 2 = Collect All Scene Images. Combine by Position pairs the single audio item with the single images item into one item carrying both fields."
+    },
+    {
+      "id": "buildVideoNode",
+      "name": "Build Video (FFmpeg: pan/zoom + captions + audio)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [ 420, -140 ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5000/build",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ audio_base64: $json.audio_base64, images: $json.images, scenes: $('Parse AI JSON').item.json.scenes, captions_text: $('Parse AI JSON').item.json.narration }) }}",
+        "options": { "response": { "response": { "responseFormat": "file" } } }
+      },
+      "notes": "Sends everything as one JSON payload (base64 audio + base64 images) — matches the rewritten /build endpoint in app.py. No more multipart form fields."
+    },
+    {
+      "id": "uploadNode",
+      "name": "Upload to YouTube",
+      "type": "n8n-nodes-base.youTube",
+      "typeVersion": 1,
+      "position": [ 640, -140 ],
+      "parameters": {
+        "resource": "video",
+        "operation": "upload",
+        "title": "={{ $('Parse AI JSON').item.json.title }}",
+        "regionCode": "IN",
+        "categoryId": "24",
+        "options": {
+          "description": "={{ $('Parse AI JSON').item.json.description }}",
+          "tags": "={{ $('Parse AI JSON').item.json.tags.join(',') }}",
+          "privacyStatus": "private",
+          "selfDeclaredMadeForKids": false,
+          "notifySubscribers": true
+        }
+      },
+      "notes": "privacyStatus starts as 'private' for safe first runs — switch to 'public' once you trust the output. Requires the YouTube scope added to your OAuth consent screen."
+    },
+    {
+      "id": "logNode",
+      "name": "Log Upload + Mark Story Used",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [ 860, -140 ],
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": { "value": "YOUR_GOOGLE_SHEET_ID", "mode": "id" },
+        "sheetName": { "value": "StoryBank", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "matchingColumns": [ "ID" ],
+          "value": {
+            "ID": "={{ $('Pick Random Unused Item').item.json.ID }}",
+            "Used": "TRUE",
+            "LastUsedDate": "={{ $now.toISODate() }}",
+            "VideoURL": "=https://youtu.be/{{ $('Upload to YouTube').item.json.id }}"
+          }
+        }
+      }
+    },
+    {
+      "id": "errorTrigger",
+      "name": "On Any Error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [ -2000, 300 ],
+      "parameters": {}
+    },
+    {
+      "id": "alertNode",
+      "name": "Alert Me (Telegram)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [ -1780, 300 ],
+      "parameters": {
+        "chatId": "YOUR_TELEGRAM_CHAT_ID",
+        "text": "=⚠️ Daily Shorts workflow failed: {{ $json.execution.error.message }}"
+      },
+      "notes": "Optional — delete this node and 'On Any Error' if you don't want failure alerts."
+    }
+  ],
+  "connections": {
+    "Daily Schedule Trigger": { "main": [ [ { "node": "Check Control Sheet (Pause Switch)", "type": "main", "index": 0 } ] ] },
+    "Check Control Sheet (Pause Switch)": { "main": [ [ { "node": "IF Status = active", "type": "main", "index": 0 } ] ] },
+    "IF Status = active": {
+      "main": [
+        [ { "node": "Get Unused Stories", "type": "main", "index": 0 } ],
+        [ { "node": "Stop (Paused)", "type": "main", "index": 0 } ]
+      ]
+    },
+    "Get Unused Stories": { "main": [ [ { "node": "Pick Random Unused Item", "type": "main", "index": 0 } ] ] },
+    "Pick Random Unused Item": { "main": [ [ { "node": "AI: Script + Video Prompt + Metadata (Gemini)", "type": "main", "index": 0 } ] ] },
+    "AI: Script + Video Prompt + Metadata (Gemini)": { "main": [ [ { "node": "Parse AI JSON", "type": "main", "index": 0 } ] ] },
+    "Parse AI JSON": {
+      "main": [
+        [
+          { "node": "Generate Narration Audio (TTS)", "type": "main", "index": 0 },
+          { "node": "Split Out Scenes", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Generate Narration Audio (TTS)": { "main": [ [ { "node": "Encode Audio Base64", "type": "main", "index": 0 } ] ] },
+    "Encode Audio Base64": { "main": [ [ { "node": "Merge Audio + Images", "type": "main", "index": 0 } ] ] },
+    "Split Out Scenes": { "main": [ [ { "node": "Generate Scene Image (Pollinations.ai)", "type": "main", "index": 0 } ] ] },
+    "Generate Scene Image (Pollinations.ai)": { "main": [ [ { "node": "Extract Image Base64", "type": "main", "index": 0 } ] ] },
+    "Extract Image Base64": { "main": [ [ { "node": "Collect All Scene Images", "type": "main", "index": 0 } ] ] },
+    "Collect All Scene Images": { "main": [ [ { "node": "Merge Audio + Images", "type": "main", "index": 1 } ] ] },
+    "Merge Audio + Images": { "main": [ [ { "node": "Build Video (FFmpeg: pan/zoom + captions + audio)", "type": "main", "index": 0 } ] ] },
+    "Build Video (FFmpeg: pan/zoom + captions + audio)": { "main": [ [ { "node": "Upload to YouTube", "type": "main", "index": 0 } ] ] },
+    "Upload to YouTube": { "main": [ [ { "node": "Log Upload + Mark Story Used", "type": "main", "index": 0 } ] ] },
+    "On Any Error": { "main": [ [ { "node": "Alert Me (Telegram)", "type": "main", "index": 0 } ] ] }
+  }
+}
